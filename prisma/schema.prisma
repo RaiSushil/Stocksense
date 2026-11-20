@@ -1,0 +1,440 @@
+// StockSense data model.
+// SQLite for local development. For production switch the provider to "postgresql"
+// and set DATABASE_URL (see README). JSON payloads are stored as String so the
+// schema works on both providers without changes.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Session {
+  id                  String    @id
+  shop                String
+  state               String
+  isOnline            Boolean   @default(false)
+  scope               String?
+  expires             DateTime?
+  accessToken         String
+  userId              BigInt?
+  firstName           String?
+  lastName            String?
+  email               String?
+  accountOwner        Boolean   @default(false)
+  locale              String?
+  collaborator        Boolean?  @default(false)
+  emailVerified       Boolean?  @default(false)
+  refreshToken        String?
+  refreshTokenExpires DateTime?
+}
+
+/// One row per installed store. Holds plan, sync state and forecasting settings.
+model Shop {
+  id                 String    @id // myshopify domain
+  name               String?
+  email              String?
+  currency           String    @default("USD")
+  timezone           String    @default("UTC")
+  isDevStore         Boolean   @default(false) // Shopify development store: test orders count as sales
+  plan               String    @default("NONE") // NONE | LAUNCH | SCALE | PRO
+  billingInterval    String? // MONTHLY | ANNUAL
+  installedAt        DateTime  @default(now())
+  uninstalledAt      DateTime?
+
+  // Sync and job state
+  syncStatus         String    @default("PENDING") // PENDING | RUNNING | READY | ERROR
+  syncStage          String?
+  syncError          String?
+  lastFullSyncAt     DateTime?
+  lastInventorySyncAt DateTime?
+  lastForecastAt     DateTime?
+  jobLockedUntil     DateTime?
+
+  // Forecasting settings
+  serviceLevel       Float     @default(0.95) // probability of not stocking out during lead time
+  coverageDays       Int       @default(60) // days of demand a purchase order should cover beyond lead time
+  overstockDays      Int       @default(90) // cover above this counts as overstock
+  defaultLeadTimeDays Int      @default(14)
+  velocityThreshold  Float     @default(1.8) // ratio vs forecast that fires a velocity alert
+
+  // Notifications
+  alertEmail         String?
+  notifyEmail        Boolean   @default(true)
+  slackWebhookUrl    String?
+  notifySlack        Boolean   @default(false)
+  alertPhone         String? // E.164, for SMS and WhatsApp alerts
+  notifySms          Boolean   @default(false)
+  notifyWhatsapp     Boolean   @default(false)
+  phoneUrgentOnly    Boolean   @default(true) // phone alerts only for stockout risk and reorder point
+  dailyDigest        Boolean   @default(true)
+
+  // Ask StockSense usage
+  askPeriodStart     DateTime  @default(now())
+  askQuestionsUsed   Int       @default(0)
+
+  nextPoNumber       Int       @default(1001)
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+}
+
+model Location {
+  id       String  @id // gid://shopify/Location/...
+  shop     String
+  name     String
+  isActive Boolean @default(true)
+
+  @@index([shop])
+}
+
+model Supplier {
+  id                  String   @id @default(cuid())
+  shop                String
+  name                String
+  email               String?
+  contactName         String?
+  phone               String?
+  website             String?
+  address             String?
+  currency            String?
+  paymentTerms        String? // e.g. Net 30
+  vendorKey           String? // Shopify product vendor(s) this supplier supplies, comma separated
+  categoryKey         String? // product categories this supplier is preferred for, comma separated
+  defaultLeadTimeDays Int      @default(14)
+  minOrderValue       Float    @default(0)
+  notes               String?
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  variants       Variant[]
+  purchaseOrders PurchaseOrder[]
+  leadTimes      LeadTimeObservation[]
+
+  @@unique([shop, name])
+  @@index([shop])
+}
+
+/// Every lead time we learn about: a received PO, or a manual change by the merchant.
+model LeadTimeObservation {
+  id         String   @id @default(cuid())
+  shop       String
+  supplierId String
+  days       Float
+  source     String // PO_RECEIVED | MANUAL
+  poId       String?
+  observedAt DateTime @default(now())
+
+  supplier Supplier @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+
+  @@index([shop, supplierId, observedAt])
+}
+
+model Variant {
+  id               String    @id // gid://shopify/ProductVariant/...
+  shop             String
+  productId        String
+  inventoryItemId  String?
+  productTitle     String
+  variantTitle     String?
+  sku              String?
+  vendor           String?
+  productType      String?
+  imageUrl         String?
+  price            Float     @default(0)
+  unitCost         Float? // from Shopify inventory item cost, editable
+  status           String    @default("ACTIVE") // product status
+  tracked          Boolean   @default(true)
+  supplierId       String?
+  casePack         Int       @default(1) // order in multiples of this
+  minOrderQty      Int       @default(0)
+  leadTimeOverride Int? // days, overrides the supplier lead time for this variant
+  firstSoldAt      DateTime?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  supplier Supplier? @relation(fields: [supplierId], references: [id], onDelete: SetNull)
+
+  @@index([shop])
+  @@index([shop, sku])
+  @@index([inventoryItemId])
+}
+
+model InventoryLevel {
+  shop       String
+  variantId  String
+  locationId String
+  available  Int      @default(0)
+  onHand     Int      @default(0)
+  incoming   Int      @default(0)
+  updatedAt  DateTime @updatedAt
+
+  @@id([variantId, locationId])
+  @@index([shop])
+}
+
+/// Units sold per variant per day. locationId "" means not attributed to a location (online orders
+/// that were not fulfilled yet). date is YYYY-MM-DD in the shop timezone.
+model SalesDaily {
+  shop          String
+  variantId     String
+  locationId    String @default("")
+  date          String
+  units         Int    @default(0)
+  revenue       Float  @default(0)
+  discountUnits Int    @default(0) // units sold with a discount applied, used to detect promotion days
+
+  @@id([variantId, locationId, date])
+  @@index([shop, date])
+}
+
+/// Processed order ids, so webhook retries and re-syncs never double count.
+model ProcessedOrder {
+  id        String   @id // order gid
+  shop      String
+  createdAt DateTime @default(now())
+
+  @@index([shop])
+}
+
+/// Planned promotions. Applied as an uplift to the forecast on those days.
+model Promotion {
+  id         String   @id @default(cuid())
+  shop       String
+  name       String
+  startDate  String // YYYY-MM-DD
+  endDate    String // YYYY-MM-DD inclusive
+  upliftPct  Float    @default(30)
+  scope      String   @default("ALL") // ALL | VENDOR | PRODUCT_TYPE
+  scopeValue String?
+  createdAt  DateTime @default(now())
+
+  @@index([shop])
+}
+
+/// Latest forecast per variant and location. locationId "" is the all-locations forecast.
+model Forecast {
+  shop            String
+  variantId       String
+  locationId      String   @default("")
+  computedAt      DateTime @default(now())
+  method          String // HOLT_SEASONAL | CROSTON | NAIVE | NO_DATA
+  historyDays     Int
+  dailyRate14     Float // trailing 14 day average
+  meanDaily       Float // forecast average over the next 30 days
+  sigmaDaily      Float
+  series          String // JSON: number[] daily forecast mean, horizon days
+  lower           String // JSON: number[] 80% lower bound
+  upper           String // JSON: number[] 80% upper bound
+  onHand          Int
+  onOrder         Int
+  leadTimeDays    Float
+  safetyStock     Float
+  reorderPoint    Float
+  daysOfCover     Float
+  stockoutDate    String?
+  suggestedQty    Int
+  revenueAtRisk   Float
+  overstockUnits  Float
+  overstockValue  Float
+  status          String // REORDER_NOW | WATCH | HEALTHY | OVERSTOCKED | NO_DATA
+  confidence      String // HIGH | MEDIUM | LOW
+  accuracy        Float? // 0..1, backtest over the last 4 weeks
+
+  @@id([variantId, locationId])
+  @@index([shop, status])
+  @@index([shop, locationId])
+}
+
+/// One row per day with the shop level forecast accuracy, for the trend badge.
+model AccuracySnapshot {
+  shop     String
+  date     String
+  accuracy Float
+  skuCount Int
+
+  @@id([shop, date])
+}
+
+model Alert {
+  id            String    @id @default(cuid())
+  shop          String
+  type          String // STOCKOUT_RISK | REORDER_POINT | VELOCITY_SHIFT | LEAD_TIME_DRIFT | OVERSTOCK
+  severity      String // CRITICAL | WARNING | INFO
+  variantId     String?
+  supplierId    String?
+  locationId    String    @default("")
+  title         String
+  message       String
+  revenueAtRisk Float     @default(0)
+  dedupeKey     String
+  fingerprint   String // changes when the underlying situation changes, re-notifies
+  status        String    @default("OPEN") // OPEN | DISMISSED | RESOLVED
+  poId          String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  notifiedAt    DateTime?
+  resolvedAt    DateTime?
+
+  @@index([shop, status])
+  @@index([shop, dedupeKey])
+}
+
+model PurchaseOrder {
+  id          String    @id @default(cuid())
+  shop        String
+  number      String // PO-1001
+  supplierId  String
+  locationId  String? // destination location
+  status      String    @default("DRAFT") // DRAFT | APPROVED | SENT | PARTIAL | RECEIVED | CANCELLED
+  source      String    @default("MANUAL") // AUTO | ASK | MANUAL | API
+  currency    String    @default("USD")
+  notes       String?
+  expectedAt  DateTime?
+  approvedAt  DateTime?
+  orderedAt   DateTime?
+  receivedAt  DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  supplier Supplier            @relation(fields: [supplierId], references: [id])
+  lines    PurchaseOrderLine[]
+
+  @@unique([shop, number])
+  @@index([shop, status])
+}
+
+model PurchaseOrderLine {
+  id          String @id @default(cuid())
+  poId        String
+  variantId   String
+  quantity    Int
+  unitCost    Float  @default(0)
+  receivedQty Int    @default(0)
+
+  po PurchaseOrder @relation(fields: [poId], references: [id], onDelete: Cascade)
+
+  @@index([poId])
+  @@index([variantId])
+}
+
+model AskThread {
+  id        String       @id @default(cuid())
+  shop      String
+  title     String?
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
+  messages  AskMessage[]
+
+  @@index([shop])
+}
+
+model AskMessage {
+  id        String   @id @default(cuid())
+  threadId  String
+  role      String // user | assistant
+  content   String // display text
+  raw       String? // JSON of the API content blocks, used to rebuild context
+  poId      String? // set when the answer drafted a purchase order
+  createdAt DateTime @default(now())
+
+  thread AskThread @relation(fields: [threadId], references: [id], onDelete: Cascade)
+
+  @@index([threadId])
+}
+
+model ApiKey {
+  id         String    @id @default(cuid())
+  shop       String
+  name       String
+  prefix     String // first characters shown in the UI
+  hash       String    @unique // sha256 of the full key
+  sandbox    Boolean   @default(false)
+  createdAt  DateTime  @default(now())
+  lastUsedAt DateTime?
+  revokedAt  DateTime?
+
+  @@index([shop])
+}
+
+model WebhookEndpoint {
+  id        String    @id @default(cuid())
+  shop      String
+  url       String
+  secret    String
+  events    String    @default("*") // comma separated alert types or *
+  active    Boolean   @default(true)
+  lastStatus Int?
+  lastSentAt DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([shop])
+}
+
+// ---------- WhatsApp assistant ----------
+
+/**
+ * A merchant's phone linked to a store with a one-time code. One phone can be linked
+ * to several stores (agencies, owners of more than one store); messages go to the
+ * active one and the merchant switches with the menu.
+ */
+model WhatsappLink {
+  id            String    @id @default(cuid())
+  shop          String
+  phone         String // E.164
+  active        Boolean   @default(true)
+  label         String?
+  canApprove    Boolean   @default(true)
+  state         String? // JSON: the current menu options and any form in progress
+  threadId      String? // Ask conversation for this phone
+  lastInboundAt DateTime?
+  createdAt     DateTime  @default(now())
+
+  @@unique([shop, phone])
+  @@index([phone])
+}
+
+/** One-time codes shown in Settings; the phone that sends one is linked to that store. */
+model WhatsappCode {
+  code      String   @id
+  shop      String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+}
+
+/** A change proposed on WhatsApp. Nothing runs until the merchant approves it. */
+model PendingAction {
+  id          String    @id @default(cuid())
+  shop        String
+  phone       String
+  type        String
+  payload     String // JSON
+  payloadHash String
+  summary     String
+  status      String    @default("PENDING") // PENDING | CONFIRMING | RUNNING | DONE | FAILED | CANCELLED | EXPIRED
+  source      String    @default("MENU") // MENU | AI
+  expiresAt   DateTime
+  decidedAt   DateTime?
+  result      String?
+  createdAt   DateTime  @default(now())
+
+  @@index([shop, createdAt])
+  @@index([phone, status])
+}
+
+/** Inbound message ids already handled, so a redelivered webhook is ignored. */
+model WhatsappInbound {
+  id        String   @id
+  createdAt DateTime @default(now())
+}
+
+/** Chart images sent on WhatsApp, served from an unguessable URL for an hour. */
+model WhatsappMedia {
+  id        String   @id
+  shop      String
+  mime      String
+  data      Bytes
+  expiresAt DateTime
+}
